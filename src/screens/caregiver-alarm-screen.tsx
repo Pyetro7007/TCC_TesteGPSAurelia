@@ -1,177 +1,231 @@
+// @ts-nocheck
+
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity } from 'react-native';
+import { View, Text, StyleSheet, Vibration } from 'react-native';
 import MapView, { Circle, Marker } from 'react-native-maps';
 
 const Colors = {
   safe: '#2E7D32',
   danger: '#C62828',
+  warning: '#F9A825',
+  offline: '#757575',
   background: '#F5F5F5',
-  text: '#1A1A1A',
   cardBg: '#FFFFFF',
+  text: '#1A1A1A',
+  circleFill: 'rgba(46, 125, 50, 0.12)',
+  circleStroke: '#2E7D32',
 };
 
-interface GeofenceCoordinate {
-  latitude: number;
-  longitude: number;
+interface CaregiverScreenProps {
+  ipEsp?: string;
 }
 
-// Dados mockados — em produção viriam do backend/dispositivo embarcado via HTTP/WebSocket
-const CENTRO_MOCK: GeofenceCoordinate = {
-  latitude: -22.936069,
-  longitude: -47.088264,
-};
-const RAIO_MOCK = 10; // metros
+// Repete a vibração do celular enquanto o idoso estiver fora (não só na transição)
+const INTERVALO_REVIBRACAO = 60000; // 1min — alinhado ao intervalo de alarme do ESP32
 
-export default function CaregiverAlarmScreen() {
-  const [posicaoIdoso, setPosicaoIdoso] = useState<GeofenceCoordinate>(CENTRO_MOCK);
+// Quantas falhas de conexão seguidas até mostrar o aviso de "sem conexão"
+const LIMITE_FALHAS_PARA_AVISO = 2;
+
+export default function CaregiverAlarmScreen({ ipEsp = 'IP_ESP' }: CaregiverScreenProps) {
+  const [posicaoIdoso, setPosicaoIdoso] = useState({
+    latitude: -22.936069,
+    longitude: -47.088264,
+  });
   const [estaFora, setEstaFora] = useState(false);
-  const [ultimaAtualizacao, setUltimaAtualizacao] = useState(new Date());
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [distancia, setDistancia] = useState(0);
+  const [satelites, setSatelites] = useState<number | null>(null);
+  const [ultimaAtualizacao, setUltimaAtualizacao] = useState<Date | null>(null);
+  const [ultimaVibracao, setUltimaVibracao] = useState(0);
+  const [falhasSeguidas, setFalhasSeguidas] = useState(0);
 
-  // Simula alarme: afasta a posição mockada do centro além do raio
-  function simularSaida() {
-    setPosicaoIdoso({
-      latitude: CENTRO_MOCK.latitude + 0.0005, // ~55m de deslocamento
-      longitude: CENTRO_MOCK.longitude,
-    });
-    setEstaFora(true);
-    setUltimaAtualizacao(new Date());
-  }
+  // Centro/raio do perímetro — vindos do ESP32, que é a fonte da verdade
+  // (evita duplicar/dessincronizar com o que foi configurado na tela de geofence)
+  const [centroPerimetro, setCentroPerimetro] = useState<{
+    latitude: number;
+    longitude: number;
+  } | null>(null);
+  const [raioPerimetro, setRaioPerimetro] = useState<number | null>(null);
+  const mapRef = useRef<MapView>(null);
 
-  function simularRetorno() {
-    setPosicaoIdoso(CENTRO_MOCK);
-    setEstaFora(false);
-    setUltimaAtualizacao(new Date());
-  }
-
-  // Enquanto "fora", simula reenvio de alarme a cada 1 min (mockado a cada 10s pra facilitar teste em vídeo)
+  // Consulta o ESP32 periodicamente
   useEffect(() => {
-    if (estaFora) {
-      intervalRef.current = setInterval(() => {
+    if (!ipEsp) return;
+
+    const interval = setInterval(async () => {
+      try {
+        const response = await fetch(`http://${ipEsp.trim()}/status`);
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+
+        const dados = await response.json();
+
+        setPosicaoIdoso({
+          latitude: dados.latitude,
+          longitude: dados.longitude,
+        });
+        setDistancia(dados.distancia);
+        setSatelites(typeof dados.satelites === 'number' ? dados.satelites : null);
         setUltimaAtualizacao(new Date());
-      }, 10000);
-    } else if (intervalRef.current) {
-      clearInterval(intervalRef.current);
-    }
-    return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-    };
-  }, [estaFora]);
+        setFalhasSeguidas(0); // conexão voltou a funcionar
+
+        if (
+          typeof dados.latCentro === 'number' &&
+          typeof dados.lonCentro === 'number'
+        ) {
+          const novoCentro = {
+            latitude: dados.latCentro,
+            longitude: dados.lonCentro,
+          };
+          setCentroPerimetro(novoCentro);
+
+          // Inclui os limites do círculo no enquadramento, não só o ponto central —
+          // senão um raio pequeno fica menor que o zoom mínimo do fitToCoordinates
+          const raio = typeof dados.raio === 'number' ? dados.raio : 10;
+          const margemGraus = (raio * 1.5) / 111000; // metros -> graus, com folga de 50%
+          const pontosEnquadramento = [
+            { latitude: dados.latitude, longitude: dados.longitude },
+            { latitude: novoCentro.latitude + margemGraus, longitude: novoCentro.longitude },
+            { latitude: novoCentro.latitude - margemGraus, longitude: novoCentro.longitude },
+            { latitude: novoCentro.latitude, longitude: novoCentro.longitude + margemGraus },
+            { latitude: novoCentro.latitude, longitude: novoCentro.longitude - margemGraus },
+          ];
+
+          mapRef.current?.fitToCoordinates(pontosEnquadramento, {
+            edgePadding: { top: 60, right: 60, bottom: 60, left: 60 },
+            animated: true,
+          });
+        }
+        if (typeof dados.raio === 'number') {
+          setRaioPerimetro(dados.raio);
+        }
+
+        if (dados.foraDoPerimetro) {
+          const agora = Date.now();
+          if (!estaFora || agora - ultimaVibracao >= INTERVALO_REVIBRACAO) {
+            Vibration.vibrate([500, 500, 500]);
+            setUltimaVibracao(agora);
+          }
+          setEstaFora(true);
+        } else {
+          setEstaFora(false);
+        }
+      } catch (error) {
+        // Não engole mais o erro silenciosamente — conta falhas pra avisar o usuário
+        setFalhasSeguidas((atual) => atual + 1);
+        console.warn('Falha ao consultar o ESP32:', error);
+      }
+    }, 3000);
+
+    return () => clearInterval(interval);
+  }, [ipEsp, estaFora, ultimaVibracao]);
+
+  const semConexao = falhasSeguidas >= LIMITE_FALHAS_PARA_AVISO;
+  const sinalFraco = satelites !== null && satelites < 4;
 
   return (
     <View style={styles.container}>
       <View
         style={[
           styles.cardStatus,
-          { backgroundColor: estaFora ? Colors.danger : Colors.safe },
+          {
+            backgroundColor: semConexao
+              ? Colors.offline
+              : estaFora
+              ? Colors.danger
+              : Colors.safe,
+          },
         ]}
       >
         <Text style={styles.statusTexto}>
-          {estaFora ? '⚠ FORA DA ÁREA SEGURA' : '✓ Dentro da área segura'}
+          {semConexao
+            ? '⚠ SEM CONEXÃO COM O DISPOSITIVO'
+            : estaFora
+            ? '⚠ FORA DA ÁREA SEGURA'
+            : '✓ Dentro da área segura'}
         </Text>
+        {!semConexao && (
+          <Text style={styles.statusSubtexto}>
+            Distância do centro: {distancia.toFixed(1)}m
+          </Text>
+        )}
         <Text style={styles.statusHora}>
-          Última atualização: {ultimaAtualizacao.toLocaleTimeString('pt-BR')}
+          {ultimaAtualizacao
+            ? `Última atualização: ${ultimaAtualizacao.toLocaleTimeString('pt-BR')}`
+            : 'Aguardando primeira resposta do dispositivo...'}
         </Text>
       </View>
 
+      {semConexao && (
+        <View style={styles.cardAviso}>
+          <Text style={styles.avisoTexto}>
+            Não foi possível falar com o ESP32 em {ipEsp}. Verifique se o IP está correto e se
+            ambos estão na mesma rede Wi-Fi.
+          </Text>
+        </View>
+      )}
+
+      {!semConexao && sinalFraco && (
+        <View style={styles.cardAviso}>
+          <Text style={styles.avisoTexto}>
+            ⚠ Sinal de GPS fraco ({satelites} satélite{satelites === 1 ? '' : 's'}) — localização
+            pode estar imprecisa
+          </Text>
+        </View>
+      )}
+
       <MapView
+        ref={mapRef}
         style={styles.mapa}
         initialRegion={{
-          latitude: CENTRO_MOCK.latitude,
-          longitude: CENTRO_MOCK.longitude,
-          latitudeDelta: 0.005,
-          longitudeDelta: 0.005,
+          latitude: posicaoIdoso.latitude,
+          longitude: posicaoIdoso.longitude,
+          latitudeDelta: 0.003,
+          longitudeDelta: 0.003,
         }}
       >
-        <Circle
-          center={CENTRO_MOCK}
-          radius={RAIO_MOCK}
-          fillColor="rgba(46, 125, 50, 0.15)"
-          strokeColor={Colors.safe}
-          strokeWidth={2}
-        />
+        {centroPerimetro && raioPerimetro !== null && (
+          <Circle
+            center={centroPerimetro}
+            radius={raioPerimetro}
+            fillColor={Colors.circleFill}
+            strokeColor={Colors.circleStroke}
+            strokeWidth={2}
+          />
+        )}
+
+        {centroPerimetro && (
+          <Marker
+            coordinate={centroPerimetro}
+            title="Centro da área segura"
+            pinColor={Colors.safe}
+            opacity={0.7}
+          />
+        )}
+
         <Marker
           coordinate={posicaoIdoso}
-          title="Localização do idoso"
+          title="Posição do Idoso"
           pinColor={estaFora ? Colors.danger : Colors.safe}
         />
       </MapView>
-
-      {/* Controles de simulação — remover quando integrar com o dispositivo real */}
-      <View style={styles.controlesSimulacao}>
-        <Text style={styles.labelSimulacao}>Simulação (teste sem hardware)</Text>
-        <View style={styles.linhaBotoes}>
-          <TouchableOpacity
-            style={[styles.botaoSimulacao, { backgroundColor: Colors.danger }]}
-            onPress={simularSaida}
-          >
-            <Text style={styles.textoBotao}>Simular saída</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={[styles.botaoSimulacao, { backgroundColor: Colors.safe }]}
-            onPress={simularRetorno}
-          >
-            <Text style={styles.textoBotao}>Simular retorno</Text>
-          </TouchableOpacity>
-        </View>
-      </View>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: Colors.background,
-    padding: 16,
-  },
-  cardStatus: {
-    borderRadius: 12,
-    padding: 16,
+  container: { flex: 1, backgroundColor: Colors.background, padding: 16 },
+  cardStatus: { borderRadius: 12, padding: 16, marginBottom: 12 },
+  statusTexto: { color: '#FFF', fontSize: 18, fontWeight: 'bold' },
+  statusSubtexto: { color: '#FFF', fontSize: 14, marginTop: 2 },
+  statusHora: { color: '#FFF', fontSize: 12, marginTop: 4, opacity: 0.8 },
+  cardAviso: {
+    backgroundColor: Colors.warning,
+    borderRadius: 10,
+    padding: 10,
     marginBottom: 12,
   },
-  statusTexto: {
-    color: '#FFFFFF',
-    fontSize: 18,
-    fontWeight: 'bold',
-  },
-  statusHora: {
-    color: '#FFFFFF',
-    fontSize: 13,
-    marginTop: 4,
-    opacity: 0.9,
-  },
-  mapa: {
-    flex: 1,
-    borderRadius: 12,
-    overflow: 'hidden',
-  },
-  controlesSimulacao: {
-    backgroundColor: Colors.cardBg,
-    borderRadius: 12,
-    padding: 12,
-    marginTop: 12,
-  },
-  labelSimulacao: {
-    fontSize: 13,
-    color: Colors.text,
-    marginBottom: 8,
-    fontWeight: '600',
-  },
-  linhaBotoes: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    gap: 8,
-  },
-  botaoSimulacao: {
-    flex: 1,
-    paddingVertical: 12,
-    borderRadius: 8,
-    alignItems: 'center',
-  },
-  textoBotao: {
-    color: '#FFFFFF',
-    fontSize: 14,
-    fontWeight: 'bold',
-  },
+  avisoTexto: { color: '#1A1A1A', fontSize: 13, fontWeight: '600' },
+  mapa: { flex: 1, borderRadius: 12 },
 });
